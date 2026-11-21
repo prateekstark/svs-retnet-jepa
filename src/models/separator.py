@@ -307,7 +307,7 @@ class DualJEPARetNetSeparator(nn.Module):
                     spec_c_song, mask_v_song, length=unseparated_song_wav.shape[-1]
                 )
                 wav_m_rolled = wav_m_song.roll(shifts=1, dims=0)
-                remix_wav = wav_v_song + wav_m_rolled
+                remix_wav = wav_v_song.detach() + wav_m_rolled.detach()
                 _, mag_remix, log_remix = self.stft_proc.stft(remix_wav)
                 mask_v_remix, _, _ = self.separator(log_remix)
                 mag_v_rec = mask_v_remix * mag_remix

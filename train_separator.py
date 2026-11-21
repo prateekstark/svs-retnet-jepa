@@ -74,7 +74,7 @@ def main() -> None:
 
     cc_major = torch.cuda.get_device_capability(device)[0] if device.type == "cuda" else 0
     use_amp = cc_major >= 7
-    bs = 16 if cc_major >= 7 else s_cfg["batch_size"]
+    bs = 8 if cc_major >= 7 else 4
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     if args.musdb_dir:
