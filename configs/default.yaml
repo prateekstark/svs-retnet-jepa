@@ -1,0 +1,45 @@
+# Configuration for Dual-JEPA Split-Latent RetNet Singing Voice Separation (SVS)
+seed: 42
+device: "cuda"
+
+audio:
+  sample_rate: 16000
+  n_fft: 1024
+  hop_length: 256
+  n_freq_bins: 512      # First 512 STFT bins (Nyquist bin 513 zero-padded on iSTFT)
+  crop_frames: 128      # 128 * 256 / 16000 = 2.048s audio segments -> 512 x 128 STFT grid
+
+model:
+  retnet_mode: "bidirectional"  # "bidirectional" or "causal" (for O(1) real-time streaming)
+  patch_size: [32, 4]           # (freq_patch, time_patch) -> 16 x 32 = 512 tokens
+  d_model: 256
+  num_layers: 6
+  decoder_layers: 4
+  num_heads: 8
+  ffn_mult: 3
+  unet_channels: 64             # Fine-grained 2D U-Net skip channels for razor-sharp STFT ratio mask
+  dropout: 0.1
+  predictor_layers: 3
+  predictor_dim: 192
+
+jepa_pretrain:
+  epochs: 40
+  batch_size: 16
+  lr: 3.0e-4
+  weight_decay: 0.03
+  ema_decay: 0.996
+  mask_ratio: 0.45
+  lambda_var: 0.05
+
+separator:
+  mode: "hybrid_ac"             # "unpaired", "paired", or "hybrid_ac"
+  epochs: 40
+  batch_size: 8
+  lr: 3.0e-4
+  paired_fraction: 1.0          # Fraction of paired studio songs used (e.g. 0.10 for 10% few-shot)
+  lambda_stft: 1.5              # Multi-resolution STFT + mask L1 loss
+  lambda_sdr: 0.5               # Time-domain SI-SDR + waveform L1 loss
+  lambda_jepa_verify: 0.4       # Dual Frozen (P_V, P_M) JEPA manifold verification loss
+  lambda_coral: 0.3             # Dual Deep CORAL latent distribution alignment
+  lambda_remix_cycle: 0.8       # Cross-song Re-Mix Cycle Consistency loss (unpaired songs)
+  lambda_orth: 0.2              # Cosine orthogonality disentanglement between z_V and z_M
