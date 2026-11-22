@@ -253,6 +253,7 @@ def main() -> None:
         if val_loader is not None and len(val_loader) > 0:
             model.eval()
             val_loss_sum, v_sdr_sum, m_sdr_sum, val_batches = 0.0, 0.0, 0.0, 0
+            v_active_n, m_active_n = 0, 0
             with torch.no_grad():
                 for mix_v, vocal_v, music_v in val_loader:
                     mix_v = mix_v.to(device).float()
@@ -270,12 +271,17 @@ def main() -> None:
                         )
                         est_v, est_m, _ = model.separate_waveforms(mix_v)
                     val_loss_sum += float(v_l.item())
-                    v_sdr_sum += compute_sdr_db(est_v.float(), vocal_v)
-                    m_sdr_sum += compute_sdr_db(est_m.float(), music_v)
+                    for bi in range(mix_v.size(0)):
+                        if vocal_v[bi].pow(2).mean().item() > 1e-5:
+                            v_sdr_sum += compute_sdr_db(est_v[bi].float(), vocal_v[bi])
+                            v_active_n += 1
+                        if music_v[bi].pow(2).mean().item() > 1e-5:
+                            m_sdr_sum += compute_sdr_db(est_m[bi].float(), music_v[bi])
+                            m_active_n += 1
                     val_batches += 1
             val_loss = val_loss_sum / max(1, val_batches)
-            val_v_sdr = v_sdr_sum / max(1, val_batches)
-            val_m_sdr = m_sdr_sum / max(1, val_batches)
+            val_v_sdr = v_sdr_sum / max(1, v_active_n)
+            val_m_sdr = m_sdr_sum / max(1, m_active_n)
 
         val_mean_sdr = 0.5 * (val_v_sdr + val_m_sdr)
         current_metric = val_mean_sdr if higher_is_better else val_loss

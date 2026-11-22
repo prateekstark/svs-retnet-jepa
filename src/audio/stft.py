@@ -111,7 +111,10 @@ class MultiResSTFTLoss(nn.Module):
             win = getattr(self, f"win_{n_fft}")
             s_est = torch.stft(est, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=win, return_complex=True).abs()
             s_ref = torch.stft(ref, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=win, return_complex=True).abs()
-            sc = torch.linalg.norm(s_ref - s_est, dim=(-2, -1)) / (torch.linalg.norm(s_ref, dim=(-2, -1)) + 1e-6)
+            ref_norm = torch.linalg.norm(s_ref, dim=(-2, -1))
+            # Clamp denominator so silent vocal intro/outro chunks never explode Spectral Convergence
+            sc = torch.linalg.norm(s_ref - s_est, dim=(-2, -1)) / ref_norm.clamp(min=1.0)
+            sc = sc.clamp(max=5.0)
             log_l1 = F.l1_loss(torch.log1p(s_est), torch.log1p(s_ref))
             total = total + sc.mean() + log_l1
         return total / len(self.fft_sizes)
