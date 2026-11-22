@@ -95,8 +95,10 @@ def main() -> None:
     use_amp = cc_major >= 7
     if args.batch_size is not None:
         bs = args.batch_size
+    elif vram_gb >= 35.0:
+        bs = s_cfg.get("batch_size_40g", 20)
     elif vram_gb >= 20.0:
-        bs = s_cfg.get("batch_size_24g", 16)
+        bs = s_cfg.get("batch_size_24g", 12)
     elif cc_major >= 7:
         bs = 8
     else:
@@ -174,7 +176,7 @@ def main() -> None:
     if resume_src is not None:
         try:
             prev = torch.load(resume_src, map_location=device, weights_only=True)
-            model.separator.load_state_dict(prev["separator"], strict=True)
+            getattr(model.separator, "_orig_mod", model.separator).load_state_dict(prev["separator"], strict=True)
             if "optimizer" in prev:
                 optimizer.load_state_dict(prev["optimizer"])
             if "scheduler" in prev:
@@ -283,9 +285,10 @@ def main() -> None:
         if improved:
             best_metric = current_metric
             no_improve = 0
+            raw_sep = getattr(model.separator, "_orig_mod", model.separator)
             torch.save(
                 {
-                    "separator": model.separator.state_dict(),
+                    "separator": raw_sep.state_dict(),
                     "mode": mode,
                     "retnet_mode": retnet_mode,
                     "epoch": epoch,
@@ -309,9 +312,10 @@ def main() -> None:
                 f"val_sdr=(V:{val_v_sdr:.2f}, M:{val_m_sdr:.2f}) dB | lr={lr_now:.2e} | no_imp={no_improve}{mark}",
                 flush=True,
             )
+            raw_sep = getattr(model.separator, "_orig_mod", model.separator)
             torch.save(
                 {
-                    "separator": model.separator.state_dict(),
+                    "separator": raw_sep.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
                     "mode": mode,

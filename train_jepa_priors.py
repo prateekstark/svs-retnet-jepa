@@ -81,6 +81,8 @@ def main() -> None:
     use_amp = cc_major >= 7
     if args.batch_size is not None:
         bs = args.batch_size
+    elif vram_gb >= 35.0:
+        bs = j_cfg.get("batch_size_40g", 64)
     elif vram_gb >= 20.0:
         bs = j_cfg.get("batch_size_24g", 48)
     elif cc_major >= 7:
@@ -113,7 +115,7 @@ def main() -> None:
     if resume_src is not None:
         try:
             prev = torch.load(resume_src, map_location=device, weights_only=True)
-            model.load_state_dict(prev["model"], strict=True)
+            getattr(model, "_orig_mod", model).load_state_dict(prev["model"], strict=True)
             if "optimizer" in prev:
                 optimizer.load_state_dict(prev["optimizer"])
             if "scheduler" in prev:
@@ -182,10 +184,11 @@ def main() -> None:
         if improved:
             best_val_loss = val_loss
             no_improve = 0
+            raw_model = getattr(model, "_orig_mod", model)
             torch.save(
                 {
-                    "model": model.state_dict(),
-                    "retnet_mode": model.encoder.mode,
+                    "model": raw_model.state_dict(),
+                    "retnet_mode": raw_model.encoder.mode,
                     "epoch": epoch,
                     "best_val_loss": best_val_loss,
                     "val_wrong_loss": val_wrong_loss,
@@ -205,12 +208,13 @@ def main() -> None:
                 f"val_wrong={val_wrong_loss:.4f} | margin={val_margin:+.4f} | lr={lr_now:.2e} | no_imp={no_improve}{mark}",
                 flush=True,
             )
+            raw_model = getattr(model, "_orig_mod", model)
             torch.save(
                 {
-                    "model": model.state_dict(),
+                    "model": raw_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
-                    "retnet_mode": model.encoder.mode,
+                    "retnet_mode": raw_model.encoder.mode,
                     "epoch": epoch,
                     "best_val_loss": best_val_loss,
                     "no_improve": no_improve,

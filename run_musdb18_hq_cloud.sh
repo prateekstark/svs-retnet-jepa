@@ -8,8 +8,8 @@ set -euo pipefail
 
 MUSDB_DIR="${1:-./data/musdb18hq}"
 CFG="configs/musdb18_hq_v2.yaml"
-CKPT_DIR="./checkpoints_hq_v2"
-OUT_DIR="./outputs_hq_v2"
+CKPT_DIR="${CKPT_DIR:-./checkpoints_hq_v2}"
+OUT_DIR="${OUT_DIR:-./outputs_hq_v2}"
 mkdir -p "${CKPT_DIR}" "${OUT_DIR}"
 
 if [ ! -d "${MUSDB_DIR}/train" ] || [ ! -d "${MUSDB_DIR}/test" ]; then
@@ -25,39 +25,39 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 echo "=== [1/4] Stage 1: Vocal & Music RetNet-JEPA Priors (Early Stopping, patience=20) ==="
 python3 train_jepa_priors.py --config "${CFG}" --stem vocal --musdb-dir "${MUSDB_DIR}" \
-    --epochs 150 --patience 20 --val-fraction 0.14 --out "${CKPT_DIR}/jepa_vocal.pt"
+    --epochs 150 --patience 20 --val-fraction 0.14 --compile --out "${CKPT_DIR}/jepa_vocal.pt"
 python3 train_jepa_priors.py --config "${CFG}" --stem music --musdb-dir "${MUSDB_DIR}" \
-    --epochs 150 --patience 20 --val-fraction 0.14 --out "${CKPT_DIR}/jepa_music.pt"
+    --epochs 150 --patience 20 --val-fraction 0.14 --compile --out "${CKPT_DIR}/jepa_music.pt"
 
 echo "=== [2/4] Stage 2: Full Paper Ablation & Data-Efficiency Suite (Early Stopping, patience=15) ==="
 # 1. Proposed 0%-Paired Dual-JEPA Separator
 python3 train_separator.py --config "${CFG}" \
     --ckpt-vocal "${CKPT_DIR}/jepa_vocal.pt" --ckpt-music "${CKPT_DIR}/jepa_music.pt" \
-    --musdb-dir "${MUSDB_DIR}" --mode unpaired --epochs 200 --patience 15 --val-fraction 0.14 \
+    --musdb-dir "${MUSDB_DIR}" --mode unpaired --epochs 200 --patience 15 --val-fraction 0.14 --compile \
     --out "${CKPT_DIR}/sep_unpaired_dual_jepa.pt"
 
 # 2. Ablation: 0%-Paired WITHOUT Dual-JEPA Verification (lambda_jepa_verify=0)
 python3 train_separator.py --config "${CFG}" \
     --ckpt-vocal "${CKPT_DIR}/jepa_vocal.pt" --ckpt-music "${CKPT_DIR}/jepa_music.pt" \
-    --musdb-dir "${MUSDB_DIR}" --mode unpaired --lambda-jepa-verify 0.0 --epochs 200 --patience 15 --val-fraction 0.14 \
+    --musdb-dir "${MUSDB_DIR}" --mode unpaired --lambda-jepa-verify 0.0 --epochs 200 --patience 15 --val-fraction 0.14 --compile \
     --out "${CKPT_DIR}/sep_unpaired_no_jepa.pt"
 
 # 3. Proposed 10% Few-Shot Hybrid AC (Dual-JEPA + 10% paired studio songs)
 python3 train_separator.py --config "${CFG}" \
     --ckpt-vocal "${CKPT_DIR}/jepa_vocal.pt" --ckpt-music "${CKPT_DIR}/jepa_music.pt" \
-    --musdb-dir "${MUSDB_DIR}" --mode hybrid_ac --paired-fraction 0.10 --epochs 200 --patience 15 --val-fraction 0.14 \
+    --musdb-dir "${MUSDB_DIR}" --mode hybrid_ac --paired-fraction 0.10 --epochs 200 --patience 15 --val-fraction 0.14 --compile \
     --out "${CKPT_DIR}/sep_hybrid_ac_10pct.pt"
 
 # 4. Proposed 25% Few-Shot Hybrid AC
 python3 train_separator.py --config "${CFG}" \
     --ckpt-vocal "${CKPT_DIR}/jepa_vocal.pt" --ckpt-music "${CKPT_DIR}/jepa_music.pt" \
-    --musdb-dir "${MUSDB_DIR}" --mode hybrid_ac --paired-fraction 0.25 --epochs 200 --patience 15 --val-fraction 0.14 \
+    --musdb-dir "${MUSDB_DIR}" --mode hybrid_ac --paired-fraction 0.25 --epochs 200 --patience 15 --val-fraction 0.14 --compile \
     --out "${CKPT_DIR}/sep_hybrid_ac_25pct.pt"
 
 # 5. Fully Supervised 100% Paired Baseline
 python3 train_separator.py --config "${CFG}" \
     --ckpt-vocal "${CKPT_DIR}/jepa_vocal.pt" --ckpt-music "${CKPT_DIR}/jepa_music.pt" \
-    --musdb-dir "${MUSDB_DIR}" --mode paired --paired-fraction 1.0 --lambda-jepa-verify 0.0 --epochs 200 --patience 15 --val-fraction 0.14 \
+    --musdb-dir "${MUSDB_DIR}" --mode paired --paired-fraction 1.0 --lambda-jepa-verify 0.0 --epochs 200 --patience 15 --val-fraction 0.14 --compile \
     --out "${CKPT_DIR}/sep_paired_100pct.pt"
 
 echo "=== [3/4] Stage 3: Official 50-Song MUSDB18-HQ Test Evaluation ==="
