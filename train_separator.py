@@ -243,7 +243,7 @@ def main() -> None:
                             paired_vocal_wav=vocal_v if mode in ("paired", "hybrid_ac") else None,
                             paired_music_wav=music_v if mode in ("paired", "hybrid_ac") else None,
                         )
-                        est_v, est_m, _ = model.separate(mix_v)
+                        est_v, est_m, _ = model.separate_waveforms(mix_v)
                     val_loss_sum += float(v_l.item())
                     v_sdr_sum += compute_sdr_db(est_v.float(), vocal_v)
                     m_sdr_sum += compute_sdr_db(est_m.float(), music_v)
