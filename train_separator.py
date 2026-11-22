@@ -243,10 +243,10 @@ def main() -> None:
                             paired_vocal_wav=vocal_v if mode in ("paired", "hybrid_ac") else None,
                             paired_music_wav=music_v if mode in ("paired", "hybrid_ac") else None,
                         )
-                        sep_out = model.separate(mix_v)
+                        est_v, est_m, _ = model.separate(mix_v)
                     val_loss_sum += float(v_l.item())
-                    v_sdr_sum += float(compute_sdr_db(sep_out["vocal_wav"].float(), vocal_v).mean().item())
-                    m_sdr_sum += float(compute_sdr_db(sep_out["music_wav"].float(), music_v).mean().item())
+                    v_sdr_sum += compute_sdr_db(est_v.float(), vocal_v)
+                    m_sdr_sum += compute_sdr_db(est_m.float(), music_v)
                     val_batches += 1
             val_loss = val_loss_sum / max(1, val_batches)
             val_v_sdr = v_sdr_sum / max(1, val_batches)
