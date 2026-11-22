@@ -9,7 +9,7 @@ audio:
   hop_length: 512
   n_freq_bins: 1024     # 1024 STFT bins (10.76 Hz/bin -> sharp harmonic & sub-100Hz separation)
   crop_frames: 128      # 128 * 512 / 22050 = 2.97s audio segments -> 1024 x 128 STFT grid
-  chunks_per_song: 48   # 48 random 3s crops per full-length song per epoch (~4,320 chunks/epoch)
+  chunks_per_song: 24   # 24 random 3s crops per full-length song per epoch (~2,064 chunks/epoch)
 
 model:
   retnet_mode: "bidirectional"  # "bidirectional" or "causal" (for O(1) real-time streaming)

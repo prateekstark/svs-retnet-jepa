@@ -24,6 +24,7 @@ class MUSDB18Dataset(Dataset):
         val_fraction: float = 0.0,
         subset: str = "all",
         augment: bool = False,
+        preload: bool = False,
     ) -> None:
         self.root_dir = Path(root_dir)
         split_dir = self.root_dir / split if (self.root_dir / split).exists() else self.root_dir
@@ -47,6 +48,9 @@ class MUSDB18Dataset(Dataset):
             self.song_dirs = all_song_dirs
 
         self._cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        if preload:
+            for idx in range(len(self.song_dirs)):
+                self._load_song_stems(idx)
 
     def __len__(self) -> int:
         return len(self.song_dirs) * self.chunks_per_song
