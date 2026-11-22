@@ -43,45 +43,54 @@ eval_model() {
 }
 
 echo "=== [1/3] Stage 1: Vocal & Music RetNet-JEPA Priors (val_margin early stopping, min 25 ep, patience 15) ==="
-python3 train_jepa_priors.py --config "${CFG}" --stem vocal --musdb-dir "${MUSDB_ROOT}" \
-    --epochs 120 --min-epochs 25 --patience 15 --val-fraction 0.14 --out "${CKPT_DIR}/jepa_vocal.pt"
-python3 train_jepa_priors.py --config "${CFG}" --stem music --musdb-dir "${MUSDB_ROOT}" \
-    --epochs 120 --min-epochs 25 --patience 15 --val-fraction 0.14 --out "${CKPT_DIR}/jepa_music.pt"
+if [ ! -f "${CKPT_DIR}/jepa_vocal.pt" ]; then
+    python3 train_jepa_priors.py --config "${CFG}" --stem vocal --musdb-dir "${MUSDB_ROOT}" \
+        --epochs 120 --min-epochs 25 --patience 15 --val-fraction 0.14 --out "${CKPT_DIR}/jepa_vocal.pt"
+else
+    echo "[SKIP] ${CKPT_DIR}/jepa_vocal.pt already exists!"
+fi
+if [ ! -f "${CKPT_DIR}/jepa_music.pt" ]; then
+    python3 train_jepa_priors.py --config "${CFG}" --stem music --musdb-dir "${MUSDB_ROOT}" \
+        --epochs 120 --min-epochs 25 --patience 15 --val-fraction 0.14 --out "${CKPT_DIR}/jepa_music.pt"
+else
+    echo "[SKIP] ${CKPT_DIR}/jepa_music.pt already exists!"
+fi
 
 echo "=== [2/3] Stage 2: Paper Benchmark Suite (Ordered by Paper Impact, Immediate Eval After Each Model) ==="
+SEP_BS="${SEP_BS:-8}"
 
 # Model 1 (Flagship #1): 0%-Paired Dual-JEPA Separator
 python3 train_separator.py --config "${CFG}" \
     --ckpt-vocal "${CKPT_DIR}/jepa_vocal.pt" --ckpt-music "${CKPT_DIR}/jepa_music.pt" \
-    --musdb-dir "${MUSDB_ROOT}" --mode unpaired --epochs 150 --min-epochs 15 --patience 12 --val-fraction 0.14 \
+    --musdb-dir "${MUSDB_ROOT}" --mode unpaired --batch-size "${SEP_BS}" --epochs 150 --min-epochs 15 --patience 12 --val-fraction 0.14 \
     --out "${CKPT_DIR}/sep_unpaired_dual_jepa.pt"
 eval_model sep_unpaired_dual_jepa
 
 # Model 2 (Core Ablation): 0%-Paired WITHOUT Dual-JEPA Verification (lambda_jepa_verify=0)
 python3 train_separator.py --config "${CFG}" \
     --ckpt-vocal "${CKPT_DIR}/jepa_vocal.pt" --ckpt-music "${CKPT_DIR}/jepa_music.pt" \
-    --musdb-dir "${MUSDB_ROOT}" --mode unpaired --lambda-jepa-verify 0.0 --epochs 150 --min-epochs 15 --patience 12 --val-fraction 0.14 \
+    --musdb-dir "${MUSDB_ROOT}" --mode unpaired --lambda-jepa-verify 0.0 --batch-size "${SEP_BS}" --epochs 150 --min-epochs 15 --patience 12 --val-fraction 0.14 \
     --out "${CKPT_DIR}/sep_unpaired_no_jepa.pt"
 eval_model sep_unpaired_no_jepa
 
 # Model 3 (Flagship #2): 10% Few-Shot Hybrid AC (Dual-JEPA + 10% paired studio songs)
 python3 train_separator.py --config "${CFG}" \
     --ckpt-vocal "${CKPT_DIR}/jepa_vocal.pt" --ckpt-music "${CKPT_DIR}/jepa_music.pt" \
-    --musdb-dir "${MUSDB_ROOT}" --mode hybrid_ac --paired-fraction 0.10 --epochs 150 --min-epochs 15 --patience 12 --val-fraction 0.14 \
+    --musdb-dir "${MUSDB_ROOT}" --mode hybrid_ac --paired-fraction 0.10 --batch-size "${SEP_BS}" --epochs 150 --min-epochs 15 --patience 12 --val-fraction 0.14 \
     --out "${CKPT_DIR}/sep_hybrid_ac_10pct.pt"
 eval_model sep_hybrid_ac_10pct
 
 # Model 4 (Upper Bound Baseline): 100% Fully Supervised Paired
 python3 train_separator.py --config "${CFG}" \
     --ckpt-vocal "${CKPT_DIR}/jepa_vocal.pt" --ckpt-music "${CKPT_DIR}/jepa_music.pt" \
-    --musdb-dir "${MUSDB_ROOT}" --mode paired --paired-fraction 1.0 --lambda-jepa-verify 0.0 --epochs 150 --min-epochs 15 --patience 12 --val-fraction 0.14 \
+    --musdb-dir "${MUSDB_ROOT}" --mode paired --paired-fraction 1.0 --lambda-jepa-verify 0.0 --batch-size "${SEP_BS}" --epochs 150 --min-epochs 15 --patience 12 --val-fraction 0.14 \
     --out "${CKPT_DIR}/sep_paired_100pct.pt"
 eval_model sep_paired_100pct
 
 # Model 5 (Data-Efficiency Curve Point): 25% Few-Shot Hybrid AC
 python3 train_separator.py --config "${CFG}" \
     --ckpt-vocal "${CKPT_DIR}/jepa_vocal.pt" --ckpt-music "${CKPT_DIR}/jepa_music.pt" \
-    --musdb-dir "${MUSDB_ROOT}" --mode hybrid_ac --paired-fraction 0.25 --epochs 150 --min-epochs 15 --patience 12 --val-fraction 0.14 \
+    --musdb-dir "${MUSDB_ROOT}" --mode hybrid_ac --paired-fraction 0.25 --batch-size "${SEP_BS}" --epochs 150 --min-epochs 15 --patience 12 --val-fraction 0.14 \
     --out "${CKPT_DIR}/sep_hybrid_ac_25pct.pt"
 eval_model sep_hybrid_ac_25pct
 
