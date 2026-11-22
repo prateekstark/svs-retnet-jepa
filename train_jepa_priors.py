@@ -22,9 +22,9 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--val-fraction", type=float, default=0.1, help="Held-out song fraction for validation/early stopping")
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs (0 to disable)")
-    parser.add_argument("--min-delta", type=float, default=1e-4, help="Minimum validation loss improvement to reset patience")
+    parser.add_argument("--min-epochs", type=int, default=25, help="Minimum warmup epochs before early stopping can trigger")
+    parser.add_argument("--min-delta", type=float, default=1e-4, help="Minimum validation margin improvement to reset patience")
     parser.add_argument("--batch-size", type=int, default=None, help="Override auto-selected batch size")
-    parser.add_argument("--compile", action="store_true", help="Enable torch.compile on Ampere/Hopper/Turing GPUs")
     parser.add_argument("--out", type=str, required=True)
     args = parser.parse_args()
 
@@ -48,6 +48,7 @@ def main() -> None:
             val_fraction=args.val_fraction,
             subset="train",
             augment=True,
+            preload=True,
         )
         val_dataset = MUSDB18Dataset(
             root_dir=args.musdb_dir,
@@ -59,6 +60,7 @@ def main() -> None:
             val_fraction=args.val_fraction,
             subset="val",
             augment=False,
+            preload=True,
         ) if args.val_fraction > 0.0 else None
     else:
         dataset = SyntheticSVSDataset(
@@ -89,18 +91,15 @@ def main() -> None:
         bs = 32
     else:
         bs = j_cfg["batch_size"]
-    nw = 2 if device.type == "cuda" else 0
-    loader = DataLoader(dataset, batch_size=bs, shuffle=True, drop_last=True, num_workers=nw, pin_memory=(device.type == "cuda"))
-    val_loader = DataLoader(val_dataset, batch_size=bs, shuffle=False, drop_last=False, num_workers=nw, pin_memory=(device.type == "cuda")) if val_dataset is not None else None
+    loader = DataLoader(dataset, batch_size=bs, shuffle=True, drop_last=True, num_workers=0, pin_memory=(device.type == "cuda"))
+    val_loader = DataLoader(val_dataset, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=(device.type == "cuda")) if val_dataset is not None else None
 
     stft_proc = build_stft_processor(cfg).to(device)
     model = build_stem_jepa(cfg, retnet_mode=args.retnet_mode).to(device)
-    if args.compile and device.type == "cuda" and cc_major >= 7:
-        model = torch.compile(model)
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=j_cfg["lr"], weight_decay=j_cfg["weight_decay"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=max(3, args.patience // 3) if args.patience > 0 else 10, min_lr=1e-6
+        optimizer, mode="max", factor=0.5, patience=max(4, args.patience // 3) if args.patience > 0 else 10, min_lr=1e-6
     )
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -108,7 +107,7 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     last_path = out_path.with_name(out_path.stem + "_last.pt")
     start_epoch = 1
-    best_val_loss = float("inf")
+    best_val_margin = float("-inf")
     no_improve = 0
 
     resume_src = last_path if last_path.exists() else (out_path if out_path.exists() else None)
@@ -121,9 +120,9 @@ def main() -> None:
             if "scheduler" in prev:
                 scheduler.load_state_dict(prev["scheduler"])
             start_epoch = prev.get("epoch", 0) + 1
-            best_val_loss = prev.get("best_val_loss", float("inf"))
+            best_val_margin = prev.get("best_val_margin", float("-inf"))
             no_improve = prev.get("no_improve", 0)
-            print(f"Resuming {resume_src} from epoch {start_epoch}/{epochs} (best_val={best_val_loss:.4f})", flush=True)
+            print(f"Resuming {resume_src} from epoch {start_epoch}/{epochs} (best_margin={best_val_margin:+.4f})", flush=True)
         except Exception:
             print(f"Starting fresh for {out_path}", flush=True)
 
@@ -179,10 +178,11 @@ def main() -> None:
             val_wrong_loss = wrong_sum / max(1, val_n)
             val_margin = val_wrong_loss - val_loss
 
-        scheduler.step(val_loss)
-        improved = val_loss < (best_val_loss - args.min_delta)
-        if improved:
-            best_val_loss = val_loss
+        if epoch >= args.min_epochs:
+            scheduler.step(val_margin)
+        improved = val_margin > (best_val_margin + args.min_delta)
+        if improved or epoch == 1:
+            best_val_margin = max(best_val_margin, val_margin)
             no_improve = 0
             raw_model = getattr(model, "_orig_mod", model)
             torch.save(
@@ -190,13 +190,14 @@ def main() -> None:
                     "model": raw_model.state_dict(),
                     "retnet_mode": raw_model.encoder.mode,
                     "epoch": epoch,
-                    "best_val_loss": best_val_loss,
+                    "best_val_loss": val_loss,
                     "val_wrong_loss": val_wrong_loss,
                     "val_margin": val_margin,
+                    "best_val_margin": best_val_margin,
                 },
                 out_path,
             )
-        else:
+        elif epoch >= args.min_epochs:
             no_improve += 1
 
         if epoch == 1 or epoch % 5 == 0 or epoch == epochs or improved:
@@ -216,20 +217,21 @@ def main() -> None:
                     "scheduler": scheduler.state_dict(),
                     "retnet_mode": raw_model.encoder.mode,
                     "epoch": epoch,
-                    "best_val_loss": best_val_loss,
+                    "best_val_loss": val_loss,
+                    "best_val_margin": best_val_margin,
                     "no_improve": no_improve,
                 },
                 last_path,
             )
 
-        if args.patience > 0 and no_improve >= args.patience:
+        if args.patience > 0 and epoch >= args.min_epochs and no_improve >= args.patience:
             print(
-                f"Early stopping triggered at epoch {epoch} (no val_loss improvement > {args.min_delta} for {args.patience} epochs). Best val_loss={best_val_loss:.4f}",
+                f"Early stopping triggered at epoch {epoch} (no val_margin improvement > {args.min_delta} for {args.patience} epochs). Best margin={best_val_margin:+.4f}",
                 flush=True,
             )
             break
 
-    print(f"Best {args.stem} JEPA checkpoint saved to {out_path} (best_val_loss={best_val_loss:.4f})", flush=True)
+    print(f"Best {args.stem} JEPA checkpoint saved to {out_path} (best_margin={best_val_margin:+.4f})", flush=True)
 
 
 if __name__ == "__main__":

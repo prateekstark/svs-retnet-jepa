@@ -80,8 +80,8 @@ def main() -> None:
         )
 
     loader = DataLoader(ds_eval, batch_size=12, shuffle=False)
-    base_v_sdr, sep_v_sdr, sep_v_sisdr = 0.0, 0.0, 0.0
-    base_m_sdr, sep_m_sdr, sep_m_sisdr = 0.0, 0.0, 0.0
+    base_v_sdrs, sep_v_sdrs, sep_v_sisdrs = [], [], []
+    base_m_sdrs, sep_m_sdrs, sep_m_sisdrs = [], [], []
     jepa_v_err, jepa_m_err = 0.0, 0.0
     mix_res = 0.0
     n_batches = 0
@@ -95,13 +95,16 @@ def main() -> None:
         _, _, log_v_est = model.stft_proc.stft(est_v)
         _, _, log_m_est = model.stft_proc.stft(est_m)
 
-        base_v_sdr += compute_sdr_db(mix_w, vocal_w)
-        sep_v_sdr += compute_sdr_db(est_v, vocal_w)
-        sep_v_sisdr += compute_sisdr_db(est_v, vocal_w)
-
-        base_m_sdr += compute_sdr_db(mix_w, music_w)
-        sep_m_sdr += compute_sdr_db(est_m, music_w)
-        sep_m_sisdr += compute_sisdr_db(est_m, music_w)
+        # Exclude silent reference chunks (standard museval protocol) and track per-chunk SDR for median & mean
+        for i in range(mix_w.shape[0]):
+            if vocal_w[i].pow(2).mean().item() > 1e-5:
+                base_v_sdrs.append(compute_sdr_db(mix_w[i], vocal_w[i]))
+                sep_v_sdrs.append(compute_sdr_db(est_v[i], vocal_w[i]))
+                sep_v_sisdrs.append(compute_sisdr_db(est_v[i], vocal_w[i]))
+            if music_w[i].pow(2).mean().item() > 1e-5:
+                base_m_sdrs.append(compute_sdr_db(mix_w[i], music_w[i]))
+                sep_m_sdrs.append(compute_sdr_db(est_m[i], music_w[i]))
+                sep_m_sisdrs.append(compute_sisdr_db(est_m[i], music_w[i]))
 
         jv, _ = model.jepa_vocal.verify_separated_spectrogram(log_v_est)
         jm, _ = model.jepa_music.verify_separated_spectrogram(log_m_est)
@@ -110,10 +113,23 @@ def main() -> None:
         mix_res += F.l1_loss(est_v + est_m, mix_w).item()
         n_batches += 1
 
+    def _stats(vals: list[float]) -> tuple[float, float]:
+        if not vals:
+            return 0.0, 0.0
+        t = torch.tensor(vals, dtype=torch.float32)
+        return float(t.median().item()), float(t.mean().item())
+
+    bv_med, bv_mean = _stats(base_v_sdrs)
+    sv_med, sv_mean = _stats(sep_v_sdrs)
+    sv_si_med, sv_si_mean = _stats(sep_v_sisdrs)
+    bm_med, bm_mean = _stats(base_m_sdrs)
+    sm_med, sm_mean = _stats(sep_m_sdrs)
+    sm_si_med, sm_si_mean = _stats(sep_m_sisdrs)
+
     n = max(1, n_batches)
-    print(f"=== Singing Voice Separation Eval (mode={mode}, retnet_mode={retnet_mode}) ===", flush=True)
-    print(f"Vocal SDR (dB, higher is better)  | Mixture: {base_v_sdr/n:+.2f} dB -> Separated: {sep_v_sdr/n:+.2f} dB (SI-SDR: {sep_v_sisdr/n:+.2f} dB)", flush=True)
-    print(f"Music SDR (dB, higher is better)  | Mixture: {base_m_sdr/n:+.2f} dB -> Separated: {sep_m_sdr/n:+.2f} dB (SI-SDR: {sep_m_sisdr/n:+.2f} dB)", flush=True)
+    print(f"=== Singing Voice Separation Eval (mode={mode}, retnet_mode={retnet_mode}, active_v={len(sep_v_sdrs)}, active_m={len(sep_m_sdrs)}) ===", flush=True)
+    print(f"Vocal SDR (dB) | Mixture Med/Mean: {bv_med:+.2f}/{bv_mean:+.2f} -> Separated Med/Mean: {sv_med:+.2f}/{sv_mean:+.2f} dB (SI-SDR: {sv_si_med:+.2f}/{sv_si_mean:+.2f} dB)", flush=True)
+    print(f"Music SDR (dB) | Mixture Med/Mean: {bm_med:+.2f}/{bm_mean:+.2f} -> Separated Med/Mean: {sm_med:+.2f}/{sm_mean:+.2f} dB (SI-SDR: {sm_si_med:+.2f}/{sm_si_mean:+.2f} dB)", flush=True)
     print(f"Dual JEPA Manifold Error (V / M)  | P_V: {jepa_v_err/n:.4f} | P_M: {jepa_m_err/n:.4f}", flush=True)
     print(f"Exact Mixture Conservation Error  | {mix_res/n:.2e}", flush=True)
 

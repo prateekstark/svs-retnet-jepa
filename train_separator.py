@@ -35,6 +35,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--val-fraction", type=float, default=0.1, help="Held-out song fraction for validation/early stopping")
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs (0 to disable)")
+    parser.add_argument("--min-epochs", type=int, default=15, help="Minimum warmup epochs before early stopping can trigger")
     parser.add_argument("--min-delta", type=float, default=1e-4, help="Minimum validation metric improvement to reset patience")
     parser.add_argument(
         "--early-stop-metric",
@@ -88,7 +89,7 @@ def main() -> None:
         lambda_mrstft=s_cfg.get("lambda_mrstft", 0.0),
     ).to(device)
     if args.compile and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7:
-        model.separator = torch.compile(model.separator)
+        model.separator = torch.compile(model.separator, dynamic=True)
 
     cc_major = torch.cuda.get_device_capability(device)[0] if device.type == "cuda" else 0
     vram_gb = (torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)) if device.type == "cuda" else 0.0
@@ -97,6 +98,8 @@ def main() -> None:
         bs = args.batch_size
     elif vram_gb >= 35.0:
         bs = s_cfg.get("batch_size_40g", 20)
+    elif vram_gb >= 28.0:
+        bs = s_cfg.get("batch_size_32g", 16)
     elif vram_gb >= 20.0:
         bs = s_cfg.get("batch_size_24g", 12)
     elif cc_major >= 7:
@@ -118,6 +121,7 @@ def main() -> None:
             val_fraction=args.val_fraction,
             subset="train",
             augment=True,
+            preload=True,
         )
         val_ds = MUSDB18Dataset(
             root_dir=args.musdb_dir,
@@ -129,6 +133,7 @@ def main() -> None:
             val_fraction=args.val_fraction,
             subset="val",
             augment=False,
+            preload=True,
         ) if args.val_fraction > 0.0 else None
     else:
         full_ds = SyntheticSVSDataset(
@@ -150,11 +155,10 @@ def main() -> None:
     n_paired = max(bs, int(round(n_total * paired_frac)))
     paired_ds = Subset(full_ds, list(range(n_paired)))
 
-    nw = 2 if device.type == "cuda" else 0
     pin = device.type == "cuda"
-    loader_unpaired = DataLoader(full_ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=nw, pin_memory=pin)
-    loader_paired = DataLoader(paired_ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=nw, pin_memory=pin)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, drop_last=False, num_workers=nw, pin_memory=pin) if val_ds is not None else None
+    loader_unpaired = DataLoader(full_ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=0, pin_memory=pin)
+    loader_paired = DataLoader(paired_ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=0, pin_memory=pin)
+    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=pin) if val_ds is not None else None
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=s_cfg["lr"], weight_decay=0.02)
@@ -275,15 +279,16 @@ def main() -> None:
 
         val_mean_sdr = 0.5 * (val_v_sdr + val_m_sdr)
         current_metric = val_mean_sdr if higher_is_better else val_loss
-        scheduler.step(current_metric)
+        if epoch >= args.min_epochs:
+            scheduler.step(current_metric)
 
         improved = (
             current_metric > (best_metric + args.min_delta)
             if higher_is_better
             else current_metric < (best_metric - args.min_delta)
         )
-        if improved:
-            best_metric = current_metric
+        if improved or epoch == 1:
+            best_metric = current_metric if improved else best_metric
             no_improve = 0
             raw_sep = getattr(model.separator, "_orig_mod", model.separator)
             torch.save(
@@ -300,7 +305,7 @@ def main() -> None:
                 },
                 out_path,
             )
-        else:
+        elif epoch >= args.min_epochs:
             no_improve += 1
 
         if epoch == 1 or epoch % 5 == 0 or epoch == epochs or improved:
@@ -328,7 +333,7 @@ def main() -> None:
                 last_path,
             )
 
-        if args.patience > 0 and no_improve >= args.patience:
+        if args.patience > 0 and epoch >= args.min_epochs and no_improve >= args.patience:
             print(
                 f"Early stopping triggered at epoch {epoch} (no {es_metric} improvement > {args.min_delta} for {args.patience} epochs). Best {es_metric}={best_metric:.4f}",
                 flush=True,
