@@ -23,6 +23,7 @@ class MUSDB18Dataset(Dataset):
         random_crop: bool = True,
         val_fraction: float = 0.0,
         subset: str = "all",
+        augment: bool = False,
     ) -> None:
         self.root_dir = Path(root_dir)
         split_dir = self.root_dir / split if (self.root_dir / split).exists() else self.root_dir
@@ -30,6 +31,7 @@ class MUSDB18Dataset(Dataset):
         self.target_samples = (crop_frames - 1) * hop_length
         self.chunks_per_song = chunks_per_song if (split == "train" and subset != "val") else 4
         self.random_crop = random_crop and (subset != "val")
+        self.augment = augment and (split == "train") and (subset != "val")
 
         all_song_dirs = sorted([d for d in split_dir.iterdir() if d.is_dir() and (d / "vocals.wav").exists()])
         if not all_song_dirs:
@@ -96,6 +98,11 @@ class MUSDB18Dataset(Dataset):
 
         v_crop = self._crop_chunk(vocal, start)
         m_crop = self._crop_chunk(music, start)
+        if self.augment:
+            g_v = float(torch.empty(1).uniform_(0.65, 1.35).item()) * (1.0 if torch.rand(1).item() > 0.5 else -1.0)
+            g_m = float(torch.empty(1).uniform_(0.65, 1.35).item()) * (1.0 if torch.rand(1).item() > 0.5 else -1.0)
+            v_crop = v_crop * g_v
+            m_crop = m_crop * g_m
         return v_crop + m_crop, v_crop, m_crop
 
 

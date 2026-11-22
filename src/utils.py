@@ -85,4 +85,5 @@ def build_unet_separator(cfg: Dict[str, Any], retnet_mode: str | None = None) ->
         unet_channels=m_cfg.get("unet_channels", 64),
         mode=mode,
         dropout=m_cfg["dropout"],
+        use_complex_mask=m_cfg.get("use_complex_mask", False),
     )

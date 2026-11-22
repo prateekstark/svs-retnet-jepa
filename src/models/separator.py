@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.audio.stft import STFTProcessor, sdr_waveform_loss
+from src.audio.stft import MultiResSTFTLoss, STFTProcessor, sdr_waveform_loss
 from src.models.retnet_jepa import (
     RetNetBlock,
     StemRetNetJEPA,
@@ -80,6 +80,7 @@ class SplitLatentRetNetUNet(nn.Module):
         unet_channels: int = 64,
         mode: str = "bidirectional",
         dropout: float = 0.1,
+        use_complex_mask: bool = False,
     ) -> None:
         super().__init__()
         pf, pt = patch_size
@@ -88,6 +89,7 @@ class SplitLatentRetNetUNet(nn.Module):
         self.n_time_patches = crop_frames // pt
         self.num_patches = self.n_freq_patches * self.n_time_patches
         self.d_model = d_model
+        self.use_complex_mask = use_complex_mask
         c = unet_channels
 
         # High-resolution U-Net encoder skips for fine harmonic & transient preservation
@@ -123,7 +125,7 @@ class SplitLatentRetNetUNet(nn.Module):
 
         self.dec2 = ConvBlock2D(c * 2 + 2, c * 2, stride=(1, 1))
         self.dec1 = ConvBlock2D(c * 2 + c + 2, c, stride=(1, 1))
-        self.mask_head = nn.Conv2d(c, 2, kernel_size=3, padding=1)
+        self.mask_head = nn.Conv2d(c, 3 if use_complex_mask else 2, kernel_size=3, padding=1)
 
     def _tokens_to_grid(self, z: torch.Tensor, linear: nn.Linear) -> torch.Tensor:
         b = z.shape[0]
@@ -162,9 +164,14 @@ class SplitLatentRetNetUNet(nn.Module):
         d2_up = F.interpolate(d2, size=s1.shape[-2:], mode="bilinear", align_corners=False)
         d1 = self.dec1(torch.cat([d2_up, s1, grid_v, grid_m], dim=1))
 
-        logits = self.mask_head(d1)  # (B, 2, 512, 128)
-        # Complementary softmax/sigmoid ratio mask M_V + M_M = 1
-        mask_v = torch.sigmoid(logits[:, 0:1] - logits[:, 1:2] + grid_v - grid_m)
+        logits = self.mask_head(d1)  # (B, 2 or 3, F, T)
+        # Complementary ratio mask M_V + M_M = 1 (with optional bounded imaginary phase correction)
+        mask_re = torch.sigmoid(logits[:, 0:1] - logits[:, 1:2] + grid_v - grid_m)
+        if self.use_complex_mask:
+            mask_im = 0.5 * torch.tanh(logits[:, 2:3])
+            mask_v = torch.cat([mask_re, mask_im], dim=1)  # (B, 2, F, T)
+        else:
+            mask_v = mask_re  # (B, 1, F, T)
         return mask_v, zv, zm
 
     def orthogonality_loss(self, zv: torch.Tensor, zm: torch.Tensor) -> torch.Tensor:
@@ -189,6 +196,7 @@ class DualJEPARetNetSeparator(nn.Module):
         lambda_coral: float = 0.3,
         lambda_remix_cycle: float = 0.8,
         lambda_orth: float = 0.2,
+        lambda_mrstft: float = 0.0,
     ) -> None:
         super().__init__()
         if mode not in ("unpaired", "paired", "hybrid_ac"):
@@ -211,6 +219,18 @@ class DualJEPARetNetSeparator(nn.Module):
         self.lambda_coral = lambda_coral
         self.lambda_remix_cycle = lambda_remix_cycle
         self.lambda_orth = lambda_orth
+        self.lambda_mrstft = lambda_mrstft
+        self.mrstft_loss = MultiResSTFTLoss() if lambda_mrstft > 0.0 else None
+
+    @staticmethod
+    def _mask_to_mags(mask_v: torch.Tensor, mag_mix: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute estimated vocal & music magnitudes from either real (B,1,F,T) or complex (B,2,F,T) mask."""
+        if mask_v.shape[1] == 2:
+            m_re, m_im = mask_v[:, 0:1], mask_v[:, 1:2]
+            v_gain = torch.sqrt(m_re.pow(2) + m_im.pow(2) + 1e-8)
+            m_gain = torch.sqrt((1.0 - m_re).pow(2) + m_im.pow(2) + 1e-8)
+            return v_gain * mag_mix, m_gain * mag_mix
+        return mask_v * mag_mix, (1.0 - mask_v) * mag_mix
 
     def separate_waveforms(
         self, wav_mix: torch.Tensor
@@ -255,8 +275,7 @@ class DualJEPARetNetSeparator(nn.Module):
             spec_c_syn, mag_syn, log_syn = self.stft_proc.stft(syn_mix_wav)
 
             mask_v_syn, zv_syn, zm_syn = self.separator(log_syn)
-            mag_v_est = mask_v_syn * mag_syn
-            mag_m_est = (1.0 - mask_v_syn) * mag_syn
+            mag_v_est, mag_m_est = self._mask_to_mags(mask_v_syn, mag_syn)
             log_v_est = torch.log1p(mag_v_est)
             log_m_est = torch.log1p(mag_m_est)
 
@@ -270,13 +289,16 @@ class DualJEPARetNetSeparator(nn.Module):
                 wav_m_syn, unpaired_music_wav
             )
             total = total + self.lambda_stft * syn_stft_loss + self.lambda_sdr * syn_sdr_l
+            if self.mrstft_loss is not None:
+                syn_mr = self.mrstft_loss(wav_v_syn, unpaired_vocal_wav) + self.mrstft_loss(wav_m_syn, unpaired_music_wav)
+                total = total + self.lambda_mrstft * syn_mr
+                metrics["syn_mrstft"] = syn_mr.item()
             metrics["unpaired_syn_stft"] = syn_stft_loss.item()
 
             # B. Real Unseparated Song Adaptation (No Ground-Truth Stems!)
             spec_c_song, mag_song, log_song = self.stft_proc.stft(unseparated_song_wav)
             mask_v_song, zv_song, zm_song = self.separator(log_song)
-            mag_v_song = mask_v_song * mag_song
-            mag_m_song = (1.0 - mask_v_song) * mag_song
+            mag_v_song, mag_m_song = self._mask_to_mags(mask_v_song, mag_song)
             log_v_song = torch.log1p(mag_v_song)
             log_m_song = torch.log1p(mag_m_song)
 
@@ -310,8 +332,7 @@ class DualJEPARetNetSeparator(nn.Module):
                 remix_wav = wav_v_song.detach() + wav_m_rolled.detach()
                 _, mag_remix, log_remix = self.stft_proc.stft(remix_wav)
                 mask_v_remix, _, _ = self.separator(log_remix)
-                mag_v_rec = mask_v_remix * mag_remix
-                mag_m_rec = (1.0 - mask_v_remix) * mag_remix
+                mag_v_rec, mag_m_rec = self._mask_to_mags(mask_v_remix, mag_remix)
                 remix_l = F.l1_loss(torch.log1p(mag_v_rec), log_v_song.detach()) + F.l1_loss(
                     torch.log1p(mag_m_rec), log_m_song.roll(shifts=1, dims=0).detach()
                 )
@@ -325,8 +346,7 @@ class DualJEPARetNetSeparator(nn.Module):
             _, mag_mp_gt, log_mp_gt = self.stft_proc.stft(paired_music_wav)
 
             mask_vp, zvp, zmp = self.separator(log_p)
-            mag_vp_est = mask_vp * mag_p
-            mag_mp_est = (1.0 - mask_vp) * mag_p
+            mag_vp_est, mag_mp_est = self._mask_to_mags(mask_vp, mag_p)
             log_vp_est = torch.log1p(mag_vp_est)
             log_mp_est = torch.log1p(mag_mp_est)
 
@@ -340,6 +360,10 @@ class DualJEPARetNetSeparator(nn.Module):
                 wav_mp_est, paired_music_wav
             )
             total = total + self.lambda_stft * p_stft_l + self.lambda_sdr * p_sdr_l
+            if self.mrstft_loss is not None:
+                p_mr = self.mrstft_loss(wav_vp_est, paired_vocal_wav) + self.mrstft_loss(wav_mp_est, paired_music_wav)
+                total = total + self.lambda_mrstft * p_mr
+                metrics["paired_mrstft"] = p_mr.item()
             metrics["paired_stft"] = p_stft_l.item()
             metrics["paired_sdr_l"] = p_sdr_l.item()
 

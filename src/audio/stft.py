@@ -88,6 +88,35 @@ def sdr_waveform_loss(est: torch.Tensor, ref: torch.Tensor, eps: float = 1e-6) -
     return l1 + neg_sdr
 
 
+class MultiResSTFTLoss(nn.Module):
+    """Multi-Resolution STFT Spectral Convergence + Log-Magnitude L1 loss (sharpens harmonics & kills low-end bleed)."""
+
+    def __init__(
+        self,
+        fft_sizes: Tuple[int, ...] = (512, 1024, 2048),
+        hop_sizes: Tuple[int, ...] = (128, 256, 512),
+    ) -> None:
+        super().__init__()
+        self.fft_sizes = fft_sizes
+        self.hop_sizes = hop_sizes
+        for n_fft in fft_sizes:
+            self.register_buffer(f"win_{n_fft}", torch.hann_window(n_fft))
+
+    def forward(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        min_len = min(est.shape[-1], ref.shape[-1])
+        est = est[..., :min_len].float()
+        ref = ref[..., :min_len].float()
+        total = torch.tensor(0.0, device=est.device)
+        for n_fft, hop in zip(self.fft_sizes, self.hop_sizes):
+            win = getattr(self, f"win_{n_fft}")
+            s_est = torch.stft(est, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=win, return_complex=True).abs()
+            s_ref = torch.stft(ref, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=win, return_complex=True).abs()
+            sc = torch.linalg.norm(s_ref - s_est, dim=(-2, -1)) / (torch.linalg.norm(s_ref, dim=(-2, -1)) + 1e-6)
+            log_l1 = F.l1_loss(torch.log1p(s_est), torch.log1p(s_ref))
+            total = total + sc.mean() + log_l1
+        return total / len(self.fft_sizes)
+
+
 class STFTProcessor(nn.Module):
     """Handles forward Complex STFT, Log-Magnitude normalization, and Exact Phase Ratio-Mask iSTFT."""
 
@@ -124,20 +153,26 @@ class STFTProcessor(nn.Module):
 
     def apply_mask_and_istft(
         self,
-        mix_complex_stft: torch.Tensor,  # (B, 513, T)
-        mask_vocal: torch.Tensor,        # (B, 1, 512, T) in [0, 1]
+        mix_complex_stft: torch.Tensor,  # (B, F+1, T)
+        mask_vocal: torch.Tensor,        # (B, 1, F, T) real OR (B, 2, F, T) complex [real, imag]
         length: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply soft ratio mask M_V and (1 - M_V) to mixture complex STFT and invert to waveforms.
+        """Apply soft real or complex ratio mask M_V and (1 - M_V) to mixture complex STFT and invert to waveforms.
         Guarantees wav_vocal + wav_music == wav_mix exactly!
         """
-        m_v = mask_vocal.squeeze(1)  # (B, 512, T)
-        # Pad 513th Nyquist frequency bin by replicating bin 512
-        m_v_full = F.pad(m_v, (0, 0, 0, 1), mode="replicate")  # (B, 513, T)
-        m_m_full = 1.0 - m_v_full
+        if mask_vocal.shape[1] == 2:
+            m_re = F.pad(mask_vocal[:, 0], (0, 0, 0, 1), mode="replicate").float()
+            m_im = F.pad(mask_vocal[:, 1], (0, 0, 0, 1), mode="replicate").float()
+            m_v_full = torch.complex(m_re, m_im)
+            m_m_full = torch.complex(1.0 - m_re, -m_im)
+        else:
+            m_v = mask_vocal.squeeze(1).float()  # (B, F, T)
+            m_v_full = F.pad(m_v, (0, 0, 0, 1), mode="replicate")  # (B, F+1, T)
+            m_m_full = 1.0 - m_v_full
 
-        stft_v = mix_complex_stft * m_v_full
-        stft_m = mix_complex_stft * m_m_full
+        mix_c = mix_complex_stft.to(torch.complex64)
+        stft_v = mix_c * m_v_full
+        stft_m = mix_c * m_m_full
 
         wav_v = torch.istft(
             stft_v,

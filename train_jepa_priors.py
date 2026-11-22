@@ -23,6 +23,8 @@ def main() -> None:
     parser.add_argument("--val-fraction", type=float, default=0.1, help="Held-out song fraction for validation/early stopping")
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs (0 to disable)")
     parser.add_argument("--min-delta", type=float, default=1e-4, help="Minimum validation loss improvement to reset patience")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override auto-selected batch size")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile on Ampere/Hopper/Turing GPUs")
     parser.add_argument("--out", type=str, required=True)
     args = parser.parse_args()
 
@@ -32,6 +34,7 @@ def main() -> None:
     j_cfg = cfg["jepa_pretrain"]
     a_cfg = cfg["audio"]
     epochs = args.epochs or j_cfg["epochs"]
+    chunks_per_song = a_cfg.get("chunks_per_song", 12)
 
     if args.musdb_dir:
         dataset = MUSDB18Dataset(
@@ -40,9 +43,11 @@ def main() -> None:
             sample_rate=a_cfg["sample_rate"],
             hop_length=a_cfg["hop_length"],
             crop_frames=a_cfg["crop_frames"],
+            chunks_per_song=chunks_per_song,
             random_crop=True,
             val_fraction=args.val_fraction,
             subset="train",
+            augment=True,
         )
         val_dataset = MUSDB18Dataset(
             root_dir=args.musdb_dir,
@@ -53,6 +58,7 @@ def main() -> None:
             random_crop=False,
             val_fraction=args.val_fraction,
             subset="val",
+            augment=False,
         ) if args.val_fraction > 0.0 else None
     else:
         dataset = SyntheticSVSDataset(
@@ -71,13 +77,24 @@ def main() -> None:
         ) if args.val_fraction > 0.0 else None
 
     cc_major = torch.cuda.get_device_capability(device)[0] if device.type == "cuda" else 0
+    vram_gb = (torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)) if device.type == "cuda" else 0.0
     use_amp = cc_major >= 7
-    bs = 32 if cc_major >= 7 else j_cfg["batch_size"]
-    loader = DataLoader(dataset, batch_size=bs, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=bs, shuffle=False, drop_last=False) if val_dataset is not None else None
+    if args.batch_size is not None:
+        bs = args.batch_size
+    elif vram_gb >= 20.0:
+        bs = j_cfg.get("batch_size_24g", 48)
+    elif cc_major >= 7:
+        bs = 32
+    else:
+        bs = j_cfg["batch_size"]
+    nw = 2 if device.type == "cuda" else 0
+    loader = DataLoader(dataset, batch_size=bs, shuffle=True, drop_last=True, num_workers=nw, pin_memory=(device.type == "cuda"))
+    val_loader = DataLoader(val_dataset, batch_size=bs, shuffle=False, drop_last=False, num_workers=nw, pin_memory=(device.type == "cuda")) if val_dataset is not None else None
 
     stft_proc = build_stft_processor(cfg).to(device)
     model = build_stem_jepa(cfg, retnet_mode=args.retnet_mode).to(device)
+    if args.compile and device.type == "cuda" and cc_major >= 7:
+        model = torch.compile(model)
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=j_cfg["lr"], weight_decay=j_cfg["weight_decay"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

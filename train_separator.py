@@ -43,6 +43,8 @@ def main() -> None:
         default="auto",
         help="Metric to monitor for early stopping ('auto': val_loss for unpaired, val_sdr for paired/hybrid_ac)",
     )
+    parser.add_argument("--batch-size", type=int, default=None, help="Override auto-selected batch size")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile on Ampere/Hopper/Turing GPUs")
     parser.add_argument("--out", type=str, required=True)
     args = parser.parse_args()
 
@@ -83,12 +85,24 @@ def main() -> None:
         lambda_coral=s_cfg["lambda_coral"],
         lambda_remix_cycle=s_cfg["lambda_remix_cycle"],
         lambda_orth=s_cfg["lambda_orth"],
+        lambda_mrstft=s_cfg.get("lambda_mrstft", 0.0),
     ).to(device)
+    if args.compile and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7:
+        model.separator = torch.compile(model.separator)
 
     cc_major = torch.cuda.get_device_capability(device)[0] if device.type == "cuda" else 0
+    vram_gb = (torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)) if device.type == "cuda" else 0.0
     use_amp = cc_major >= 7
-    bs = 8 if cc_major >= 7 else 4
+    if args.batch_size is not None:
+        bs = args.batch_size
+    elif vram_gb >= 20.0:
+        bs = s_cfg.get("batch_size_24g", 16)
+    elif cc_major >= 7:
+        bs = 8
+    else:
+        bs = 4
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    chunks_per_song = a_cfg.get("chunks_per_song", 12)
 
     if args.musdb_dir:
         full_ds = MUSDB18Dataset(
@@ -97,9 +111,11 @@ def main() -> None:
             sample_rate=a_cfg["sample_rate"],
             hop_length=a_cfg["hop_length"],
             crop_frames=a_cfg["crop_frames"],
+            chunks_per_song=chunks_per_song,
             random_crop=True,
             val_fraction=args.val_fraction,
             subset="train",
+            augment=True,
         )
         val_ds = MUSDB18Dataset(
             root_dir=args.musdb_dir,
@@ -110,6 +126,7 @@ def main() -> None:
             random_crop=False,
             val_fraction=args.val_fraction,
             subset="val",
+            augment=False,
         ) if args.val_fraction > 0.0 else None
     else:
         full_ds = SyntheticSVSDataset(
@@ -131,9 +148,11 @@ def main() -> None:
     n_paired = max(bs, int(round(n_total * paired_frac)))
     paired_ds = Subset(full_ds, list(range(n_paired)))
 
-    loader_unpaired = DataLoader(full_ds, batch_size=bs, shuffle=True, drop_last=True)
-    loader_paired = DataLoader(paired_ds, batch_size=bs, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, drop_last=False) if val_ds is not None else None
+    nw = 2 if device.type == "cuda" else 0
+    pin = device.type == "cuda"
+    loader_unpaired = DataLoader(full_ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=nw, pin_memory=pin)
+    loader_paired = DataLoader(paired_ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=nw, pin_memory=pin)
+    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, drop_last=False, num_workers=nw, pin_memory=pin) if val_ds is not None else None
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=s_cfg["lr"], weight_decay=0.02)
