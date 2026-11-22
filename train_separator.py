@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
+from src.audio.stft import compute_sdr_db
 from src.data.musdb import MUSDB18Dataset, SyntheticSVSDataset
 from src.models.separator import DualJEPARetNetSeparator
 from src.utils import (
@@ -32,6 +33,16 @@ def main() -> None:
     parser.add_argument("--lambda-jepa-verify", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--val-fraction", type=float, default=0.1, help="Held-out song fraction for validation/early stopping")
+    parser.add_argument("--patience", type=int, default=15, help="Early stopping patience in epochs (0 to disable)")
+    parser.add_argument("--min-delta", type=float, default=1e-4, help="Minimum validation metric improvement to reset patience")
+    parser.add_argument(
+        "--early-stop-metric",
+        type=str,
+        choices=["auto", "val_loss", "val_sdr"],
+        default="auto",
+        help="Metric to monitor for early stopping ('auto': val_loss for unpaired, val_sdr for paired/hybrid_ac)",
+    )
     parser.add_argument("--out", type=str, required=True)
     args = parser.parse_args()
 
@@ -45,6 +56,8 @@ def main() -> None:
     epochs = args.epochs or s_cfg["epochs"]
     paired_frac = args.paired_fraction if args.paired_fraction is not None else s_cfg["paired_fraction"]
     l_jepa_ver = args.lambda_jepa_verify if args.lambda_jepa_verify is not None else s_cfg["lambda_jepa_verify"]
+    es_metric = ("val_loss" if mode == "unpaired" else "val_sdr") if args.early_stop_metric == "auto" else args.early_stop_metric
+    higher_is_better = es_metric == "val_sdr"
 
     ckpt_v = torch.load(args.ckpt_vocal, map_location="cpu", weights_only=True)
     ckpt_m = torch.load(args.ckpt_music, map_location="cpu", weights_only=True)
@@ -85,7 +98,19 @@ def main() -> None:
             hop_length=a_cfg["hop_length"],
             crop_frames=a_cfg["crop_frames"],
             random_crop=True,
+            val_fraction=args.val_fraction,
+            subset="train",
         )
+        val_ds = MUSDB18Dataset(
+            root_dir=args.musdb_dir,
+            split="train",
+            sample_rate=a_cfg["sample_rate"],
+            hop_length=a_cfg["hop_length"],
+            crop_frames=a_cfg["crop_frames"],
+            random_crop=False,
+            val_fraction=args.val_fraction,
+            subset="val",
+        ) if args.val_fraction > 0.0 else None
     else:
         full_ds = SyntheticSVSDataset(
             num_samples=300,
@@ -94,6 +119,13 @@ def main() -> None:
             crop_frames=a_cfg["crop_frames"],
             seed=cfg["seed"],
         )
+        val_ds = SyntheticSVSDataset(
+            num_samples=32,
+            sample_rate=a_cfg["sample_rate"],
+            hop_length=a_cfg["hop_length"],
+            crop_frames=a_cfg["crop_frames"],
+            seed=cfg["seed"] + 9999,
+        ) if args.val_fraction > 0.0 else None
 
     n_total = len(full_ds)
     n_paired = max(bs, int(round(n_total * paired_frac)))
@@ -101,19 +133,51 @@ def main() -> None:
 
     loader_unpaired = DataLoader(full_ds, batch_size=bs, shuffle=True, drop_last=True)
     loader_paired = DataLoader(paired_ds, batch_size=bs, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, drop_last=False) if val_ds is not None else None
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=s_cfg["lr"], weight_decay=0.02)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max" if higher_is_better else "min",
+        factor=0.5,
+        patience=max(3, args.patience // 3) if args.patience > 0 else 10,
+        min_lr=1e-6,
+    )
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    last_path = out_path.with_name(out_path.stem + "_last.pt")
+
+    start_epoch = 1
+    best_metric = float("-inf") if higher_is_better else float("inf")
+    no_improve = 0
+    resume_src = last_path if last_path.exists() else (out_path if out_path.exists() else None)
+    if resume_src is not None:
+        try:
+            prev = torch.load(resume_src, map_location=device, weights_only=True)
+            model.separator.load_state_dict(prev["separator"], strict=True)
+            if "optimizer" in prev:
+                optimizer.load_state_dict(prev["optimizer"])
+            if "scheduler" in prev:
+                scheduler.load_state_dict(prev["scheduler"])
+            start_epoch = prev.get("epoch", 0) + 1
+            best_metric = prev.get("best_metric", best_metric)
+            no_improve = prev.get("no_improve", 0)
+            print(
+                f"Resuming {resume_src} from epoch {start_epoch}/{epochs} (best {es_metric}={best_metric:.4f})",
+                flush=True,
+            )
+        except Exception:
+            print(f"Starting fresh for {out_path}", flush=True)
 
     print(
         f"[Separator mode={mode}] retnet_mode={retnet_mode} | paired_frac={paired_frac} ({n_paired}/{n_total}) | "
-        f"lambda_jepa_verify={l_jepa_ver} | amp={use_amp} | bs={bs} | trainable_params={sum(p.numel() for p in trainable):,}",
+        f"lambda_jepa_verify={l_jepa_ver} | amp={use_amp} | bs={bs} | es={es_metric} (patience={args.patience}) | "
+        f"trainable_params={sum(p.numel() for p in trainable):,}",
         flush=True,
     )
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         model.jepa_vocal.eval()
         model.jepa_music.eval()
@@ -156,15 +220,99 @@ def main() -> None:
                 running[k] = running.get(k, 0.0) + v
 
         n_steps = max(1, len(loader_unpaired))
-        if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
-            summary = " | ".join(f"{k}={v/n_steps:.4f}" for k, v in running.items())
-            print(f"Epoch {epoch:03d}/{epochs} | {summary}", flush=True)
+        train_total = running.get("total", 0.0) / n_steps
+
+        # Held-out validation pass (leak-free val_loss + diagnostic vocal/music SDR)
+        val_loss = train_total
+        val_v_sdr, val_m_sdr = 0.0, 0.0
+        if val_loader is not None and len(val_loader) > 0:
+            model.eval()
+            val_loss_sum, v_sdr_sum, m_sdr_sum, val_batches = 0.0, 0.0, 0.0, 0
+            with torch.no_grad():
+                for mix_v, vocal_v, music_v in val_loader:
+                    mix_v = mix_v.to(device).float()
+                    vocal_v = vocal_v.to(device).float()
+                    music_v = music_v.to(device).float()
+                    music_v_unp = music_v.roll(shifts=1, dims=0) if mix_v.size(0) > 1 else music_v
+                    with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
+                        v_l, _ = model.forward_step(
+                            unpaired_vocal_wav=vocal_v,
+                            unpaired_music_wav=music_v_unp,
+                            unseparated_song_wav=mix_v,
+                            paired_mix_wav=mix_v if mode in ("paired", "hybrid_ac") else None,
+                            paired_vocal_wav=vocal_v if mode in ("paired", "hybrid_ac") else None,
+                            paired_music_wav=music_v if mode in ("paired", "hybrid_ac") else None,
+                        )
+                        sep_out = model.separate(mix_v)
+                    val_loss_sum += float(v_l.item())
+                    v_sdr_sum += float(compute_sdr_db(sep_out["vocal_wav"].float(), vocal_v).mean().item())
+                    m_sdr_sum += float(compute_sdr_db(sep_out["music_wav"].float(), music_v).mean().item())
+                    val_batches += 1
+            val_loss = val_loss_sum / max(1, val_batches)
+            val_v_sdr = v_sdr_sum / max(1, val_batches)
+            val_m_sdr = m_sdr_sum / max(1, val_batches)
+
+        val_mean_sdr = 0.5 * (val_v_sdr + val_m_sdr)
+        current_metric = val_mean_sdr if higher_is_better else val_loss
+        scheduler.step(current_metric)
+
+        improved = (
+            current_metric > (best_metric + args.min_delta)
+            if higher_is_better
+            else current_metric < (best_metric - args.min_delta)
+        )
+        if improved:
+            best_metric = current_metric
+            no_improve = 0
             torch.save(
-                {"separator": model.separator.state_dict(), "mode": mode, "retnet_mode": retnet_mode, "epoch": epoch},
+                {
+                    "separator": model.separator.state_dict(),
+                    "mode": mode,
+                    "retnet_mode": retnet_mode,
+                    "epoch": epoch,
+                    "best_metric": best_metric,
+                    "es_metric": es_metric,
+                    "val_loss": val_loss,
+                    "val_v_sdr": val_v_sdr,
+                    "val_m_sdr": val_m_sdr,
+                },
                 out_path,
             )
+        else:
+            no_improve += 1
 
-    print(f"Saved separator checkpoint to {out_path}", flush=True)
+        if epoch == 1 or epoch % 5 == 0 or epoch == epochs or improved:
+            summary = " | ".join(f"{k}={v/n_steps:.4f}" for k, v in running.items())
+            lr_now = optimizer.param_groups[0]["lr"]
+            mark = " *BEST*" if improved else ""
+            print(
+                f"Epoch {epoch:03d}/{epochs} | {summary} | val_loss={val_loss:.4f} | "
+                f"val_sdr=(V:{val_v_sdr:.2f}, M:{val_m_sdr:.2f}) dB | lr={lr_now:.2e} | no_imp={no_improve}{mark}",
+                flush=True,
+            )
+            torch.save(
+                {
+                    "separator": model.separator.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "mode": mode,
+                    "retnet_mode": retnet_mode,
+                    "epoch": epoch,
+                    "best_metric": best_metric,
+                    "es_metric": es_metric,
+                    "no_improve": no_improve,
+                },
+                last_path,
+            )
+
+        if args.patience > 0 and no_improve >= args.patience:
+            print(
+                f"Early stopping triggered at epoch {epoch} (no {es_metric} improvement > {args.min_delta} for {args.patience} epochs). Best {es_metric}={best_metric:.4f}",
+                flush=True,
+            )
+            break
+
+    print(f"Best separator checkpoint saved to {out_path} (best {es_metric}={best_metric:.4f})", flush=True)
 
 
 if __name__ == "__main__":

@@ -21,17 +21,28 @@ class MUSDB18Dataset(Dataset):
         crop_frames: int = 128,
         chunks_per_song: int = 12,
         random_crop: bool = True,
+        val_fraction: float = 0.0,
+        subset: str = "all",
     ) -> None:
         self.root_dir = Path(root_dir)
         split_dir = self.root_dir / split if (self.root_dir / split).exists() else self.root_dir
         self.sample_rate = sample_rate
         self.target_samples = (crop_frames - 1) * hop_length
-        self.chunks_per_song = chunks_per_song if split == "train" else 4
-        self.random_crop = random_crop
+        self.chunks_per_song = chunks_per_song if (split == "train" and subset != "val") else 4
+        self.random_crop = random_crop and (subset != "val")
 
-        self.song_dirs = sorted([d for d in split_dir.iterdir() if d.is_dir() and (d / "vocals.wav").exists()])
-        if not self.song_dirs:
+        all_song_dirs = sorted([d for d in split_dir.iterdir() if d.is_dir() and (d / "vocals.wav").exists()])
+        if not all_song_dirs:
             raise FileNotFoundError(f"No MUSDB18 song folders with vocals.wav found in {split_dir}")
+
+        if val_fraction > 0.0 and subset in ("train", "val") and len(all_song_dirs) >= 2:
+            n_val = max(1, int(round(len(all_song_dirs) * val_fraction)))
+            if subset == "val":
+                self.song_dirs = all_song_dirs[-n_val:]
+            else:
+                self.song_dirs = all_song_dirs[:-n_val]
+        else:
+            self.song_dirs = all_song_dirs
 
         self._cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
