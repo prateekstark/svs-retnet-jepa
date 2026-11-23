@@ -10,4 +10,7 @@ __pycache__/
 *.zip
 *.tar.gz
 svs_results*.txt
+/private/
+/paper/
+run_musdb18_*colab.sh
 .DS_Store
