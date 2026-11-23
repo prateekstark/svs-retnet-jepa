@@ -103,8 +103,17 @@ All models below use the **exact same 21.7M-parameter `SplitLatentRetNetUNet`** 
 | **25% Few-Shot Hybrid AC (Proposed)** | **25%** (~21 songs) | `+7.25 dB` | **`+7.59 dB`** | `+6.48 dB` | `+13.61 / +17.79 dB` | `0.1853` / `0.1712` |
 
 > **Exact Mixture Conservation:** Every model preserves $\lVert \hat{v} + \hat{m} - x_{\text{mix}} \rVert_1 = \mathbf{1.37 \times 10^{-8}}$.
->
-> **Evaluation Note:** Table metrics are exact time-domain SNR/uSDR and SI-SDR evaluated on 4 deterministic 3-second chunks per test song across all 50 MUSDB18-HQ test tracks at 22.05 kHz mono (excluding silent reference chunks with energy $< 10^{-5}$). Full-song 44.1 kHz stereo `museval` evaluation is planned for direct external benchmark comparison.
+
+### Official Full-Song 44.1 kHz Stereo `museval` (BSS-Eval v4, 50 Full Test Songs)
+
+We also evaluated our 22.05 kHz mono-trained checkpoints channel-by-channel against **unmodified 44.1 kHz stereo** MUSDB18-HQ ground truth across all 50 full-length test tracks using official `museval.evaluate(win=44100, hop=44100)` (`evaluate_museval.py`, median-of-medians SDR/SIR/SAR):
+
+| Model (22.05 kHz Mono → 44.1 kHz Stereo Eval) | Paired Data | **Vocal Med SDR** | **Vocal Mean SDR** | **Vocal SIR** *(Bleed Rej.)* | **Vocal SAR** *(Artifacts)* | **Music Med SDR** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **0% Unpaired Dual-JEPA** (`sep_unpaired_dual_jepa.pt`) | **0%** | `+5.48 dB` | `+5.06 dB` | **`+15.91 dB`** | `+5.46 dB` | `+12.22 dB` |
+| **10% Few-Shot Hybrid AC** (`sep_hybrid_ac_10pct.pt`) | **10%** (~8 songs) | **`+5.78 dB`** *(peaks `+9.11 dB`)* | **`+5.52 dB`** | `+14.06 dB` | **`+6.35 dB`** *(+0.89 dB)* | **`+12.57 dB`** |
+
+> **Key Finding (SIR vs. SAR Trade-off):** Frozen Dual-JEPA (`λ_jepa = 0.4`) achieves strong music-bleed suppression (**`+15.91 dB` SIR**, `+1.85 dB` higher than Hybrid AC) at a slight artifact cost (`SAR = +5.46 dB`), while 10% Hybrid AC recovers `+0.89 dB` SAR (`+6.35 dB`) to reach **`+5.78 dB` Vocal / `+12.57 dB` Music** official 44.1 kHz stereo `museval` SDR despite operating at 22.05 kHz (missing `11–22 kHz` vocal air).
 
 ---
 
